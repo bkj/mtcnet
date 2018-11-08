@@ -9,3 +9,4 @@ python main.py | tee results/res-05.jl
 
 # 20-way / 1-shot
 python main.py | tee results/res-20.jl
+
