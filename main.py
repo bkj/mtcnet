@@ -5,14 +5,15 @@
     
     * Super simple implementation of matching networks
     * Only works for 1-shot ATM
-    * Adds a linear layer to network
     * No rotation
     * Not sure data split is the same as in original paper
 """
 
 import numpy as np
 from tqdm import tqdm
+from time import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 
 import torch
 from torch import nn
@@ -24,9 +25,13 @@ from torchvision import transforms
 from rsub import *
 from matplotlib import pyplot as plt
 
+np.random.seed(789)
 torch.backends.cudnn.benchmark = True
 torch.manual_seed(123)
 torch.cuda.manual_seed(456)
+
+# --
+# Data generators
 
 class OmniglotTaskWrapper:
     def __init__(self, dataset, rotation=False):
@@ -45,10 +50,8 @@ class OmniglotTaskWrapper:
         for i, lab in enumerate(classes):
             is_target = int(i == 0)
             idxs = np.random.choice(self.lookup[lab], num_shots + is_target, replace=False)
-            for idx in idxs:
-                task.append(self.dataset[idx])
+            task += [self.dataset[idx][0] for idx in idxs]
         
-        task = list(zip(*task))[0]
         task = torch.cat(task).unsqueeze(1)
         
         return task[:1], task[1:]
@@ -62,11 +65,32 @@ class OmniglotTaskWrapper:
             q.append(q_)
             X.append(X_)
         
-        q, X = torch.stack(q).cuda(), torch.stack(X).cuda()
-        y = torch.LongTensor([0] * batch_size).cuda()
+        q, X = torch.stack(q), torch.stack(X)
+        y = torch.LongTensor([0] * batch_size)
         
         return q, X, y
 
+_fn = None
+def make_batches(wrapper, num_epochs, num_steps, batch_size, num_classes, num_shots, max_workers=16):
+    global _fn
+    def _fn(seed):
+        np.random.seed(111 * seed)
+        out = []
+        for _ in range(num_steps):
+            out.append(wrapper.sample_tasks(
+                batch_size=batch_size,
+                num_classes=num_classes,
+                num_shots=num_shots
+            ))
+        
+        return out
+            
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        for batches in ex.map(_fn, range(num_epochs)):
+            for q, X, y in batches:
+                yield q.cuda(), X.cuda(), y.cuda()
+# --
+# Network
 
 class Net(nn.Module):
     def __init__(self, in_channels=1, img_sz=28, hidden_dim=64):
@@ -126,18 +150,36 @@ transform = transforms.Compose([
 back_dataset = Omniglot(root='./data', background=True, transform=transform)
 test_dataset = Omniglot(root='./data', background=False, transform=transform)
 
-
 # --
 # Run
 
 num_epochs  = 10
 num_steps   = 100
-
 batch_size  = 32
 num_classes = 5
 
 back_wrapper = OmniglotTaskWrapper(back_dataset)
 test_wrapper = OmniglotTaskWrapper(test_dataset)
+
+back_loader  = make_batches(
+    wrapper=back_wrapper,
+    num_epochs=num_epochs,
+    num_steps=num_steps,
+    batch_size=batch_size,
+    num_classes=num_classes,
+    num_shots=1
+)
+
+test_loader  = make_batches(
+    wrapper=test_wrapper, 
+    num_epochs=1,
+    num_steps=num_epochs,
+    batch_size=10 * batch_size,
+    num_classes=num_classes,
+    num_shots=1
+)
+
+
 
 net = Net().cuda()
 opt = torch.optim.Adam(net.parameters())
@@ -146,14 +188,13 @@ train_loss = []
 train_pred = []
 
 for epoch in range(num_epochs):
+    t = time()
     
-    # --
     # Train
-
     _ = net.train()
     for step in range(num_steps):
         opt.zero_grad()
-        q, X, y = back_wrapper.sample_tasks(batch_size=batch_size, num_classes=num_classes, num_shots=1)
+        q, X, y = next(back_loader)
         sim = net(q, X)
         loss = F.cross_entropy(sim, y)
         loss.backward()
@@ -162,18 +203,18 @@ for epoch in range(num_epochs):
         train_pred += list((sim.argmax(dim=-1) == 0).cpu().numpy())
         train_loss.append(float(loss))
     
-    # --
     # Eval
-
     _ = net.eval()
-    q, X, _ = test_wrapper.sample_tasks(batch_size=10 * batch_size, num_classes=num_classes, num_shots=1)
-    sim = net(q, X)
+    q, X, _ = next(test_loader)
+    sim  = net(q, X)
     test_pred = list((sim.argmax(dim=-1) == 0).cpu().numpy())
     
+    # Log
     print({
         "train_loss" : np.mean(train_loss[-100:]),
         "train_acc"  : np.mean(train_pred[-100:]),
         "test_acc"   : np.mean(test_pred),
+        "elapsed"    : time() - t,
     })
 
 

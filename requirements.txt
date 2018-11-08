@@ -2,3 +2,4 @@ tqdm
 git+https://github.com/bkj/rsub
 matplotlib
 pandas
+joblib
