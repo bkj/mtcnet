@@ -13,6 +13,7 @@ import sys
 import json
 import argparse
 import numpy as np
+from tqdm import tqdm
 from time import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -77,13 +78,13 @@ class OmniglotTaskWrapper:
         
         return q, X, y
 
-
 _fn = None
 def make_batches(wrapper, num_epochs, num_steps, batch_size, num_classes, num_shots, max_workers=16):
     """ Fancy function to parallelize batch creation """
     global _fn
+    seed_ = (1 + np.random.choice(int(1e6)))
     def _fn(seed):
-        np.random.seed(111 * seed)
+        np.random.seed(seed_ + seed)
         out = []
         for _ in range(num_steps):
             out.append(wrapper.sample_tasks(
@@ -98,16 +99,19 @@ def make_batches(wrapper, num_epochs, num_steps, batch_size, num_classes, num_sh
         for batches in ex.map(_fn, range(num_epochs)):
             for q, X, y in batches:
                 yield q.cuda(), X.cuda(), y.cuda()
+
+
 # --
 # Network
 
 class Net(nn.Module):
-    def __init__(self, in_channels=1, img_sz=28, hidden_dim=64):
+    def __init__(self, num_classes, in_channels=1, img_sz=28, hidden_dim=64):
         super().__init__()
         
         self.in_channels = in_channels
         self.img_sz      = img_sz
         self.hidden_dim  = hidden_dim
+        self.num_classes = num_classes
         
         self.layers = nn.Sequential(
             self._make_layer(in_channels=1, out_channels=self.hidden_dim),
@@ -115,6 +119,7 @@ class Net(nn.Module):
             self._make_layer(in_channels=self.hidden_dim, out_channels=self.hidden_dim),
             self._make_layer(in_channels=self.hidden_dim, out_channels=self.hidden_dim),
         )
+        self.linear = nn.Linear(self.hidden_dim, self.num_classes)
     
     def _make_layer(self, in_channels, out_channels):
         return nn.Sequential(
@@ -124,6 +129,11 @@ class Net(nn.Module):
             nn.MaxPool2d(kernel_size=2)
         )
     
+    def forward(self, x):
+        x = self.layers(x).squeeze()
+        x = self.linear(x)
+        return x
+
     def _batch_forward(self, x):
         bs   = x.shape[0]
         nobs = x.shape[1]
@@ -133,23 +143,46 @@ class Net(nn.Module):
         x = x.view(bs, nobs, self.hidden_dim)
         
         return x
-
-    def forward(self, q, X):
+    
+    def q_forward(self, q, X):
         X = self._batch_forward(X)
         q = self._batch_forward(q)
+        
+        # !! This might be the issue
+        # q = F.normalize(q, dim=-1)
         X = F.normalize(X, dim=-1)
+        
         sim = torch.bmm(q, X.transpose(1, 2)).squeeze()
         return sim
 
 
+class RotOmniglot(Omniglot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        self.num_classes = len(set(list(zip(*self._flat_character_images))[1]))
+        
+    def __getitem__(self, index):
+        new_index = index % len(self._flat_character_images)
+        rotation  = index // len(self._flat_character_images)
+        
+        img, character_class = super().__getitem__(new_index)
+        
+        img = img.numpy()
+        img = np.rot90(img, k=rotation, axes=(1, 2))
+        img = np.ascontiguousarray(img)
+        img = torch.Tensor(img)
+
+        new_class = (self.num_classes * rotation) + character_class
+        
+        return img, new_class
+        
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num-epochs', type=int, default=10)
-    parser.add_argument('--num-steps', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--num-classes', type=int, default=5)
-    
     return parser.parse_args()
 
 
@@ -159,80 +192,80 @@ if __name__ == "__main__":
     
     # --
     # IO
-
+    
     stats = {
         "mean" : (0.07793742418289185,),
         "std"  : (0.2154727578163147,)
     }
-
+    
     transform = transforms.Compose([
         transforms.Resize(28),
         transforms.ToTensor(),
         transforms.Lambda(lambda x: 1 - x), # Make sparse
         transforms.Normalize(**stats),
     ])
-
-    back_dataset = Omniglot(root='./data', background=True, transform=transform)
-    test_dataset = Omniglot(root='./data', background=False, transform=transform)
-
-    back_wrapper = OmniglotTaskWrapper(back_dataset)
-    test_wrapper = OmniglotTaskWrapper(test_dataset)
-
-    back_loader  = make_batches(
-        wrapper=back_wrapper,
-        num_epochs=args.num_epochs,
-        num_steps=args.num_steps,
+    
+    back_dataset = RotOmniglot(root='./data', background=True, transform=transform)
+    test_dataset = RotOmniglot(root='./data', background=False, transform=transform)
+    
+    
+    back_loader = torch.utils.data.DataLoader(
+        back_dataset,
         batch_size=args.batch_size,
-        num_classes=args.num_classes,
-        num_shots=1
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
     )
-
-    test_loader  = make_batches(
-        wrapper=test_wrapper, 
+    test_loader = make_batches(
+        wrapper=OmniglotTaskWrapper(test_dataset), 
         num_epochs=1,
         num_steps=args.num_epochs,
-        batch_size=10 * args.batch_size,
+        batch_size=20 * args.batch_size,
         num_classes=args.num_classes,
         num_shots=1
     )
+
 
     # --
     # Run
 
-    net = Net().cuda()
+    num_classes = len(set(list(zip(*back_dataset._flat_character_images))[1]))
+
+    net = Net(num_classes=num_classes).cuda()
     opt = torch.optim.Adam(net.parameters())
 
     train_loss = []
-    train_correct = []
-    epoch_train_obs = args.num_steps * args.batch_size
+    train_pred = []
+    epoch_train_obs = len(back_dataset)
     
     for epoch in range(args.num_epochs):
         t = time()
         
         # Train
         _ = net.train()
-        for step in range(args.num_steps):
+        for X, y in tqdm(back_loader):
+            X, y = X.cuda(), y.cuda()
+            
             opt.zero_grad()
-            q, X, y = next(back_loader)
-            sim  = net(q, X)
-            loss = F.cross_entropy(sim, y)
+            out  = net(X)
+            loss = F.cross_entropy(out, y)
             loss.backward()
             opt.step()
             
-            train_correct += list((sim.argmax(dim=-1) == 0).cpu().numpy())
+            train_pred += list((out.argmax(dim=-1) == y.squeeze()).cpu().numpy())
             train_loss.append(float(loss))
         
         # Eval
         _ = net.eval()
         q, X, _ = next(test_loader)
-        sim  = net(q, X)
-        test_correct = list((sim.argmax(dim=-1) == 0).cpu().numpy())
+        sim  = net.q_forward(q, X)
+        test_acc = list((sim.argmax(dim=-1) == 0).cpu().numpy())
         
         # Log
         print(json.dumps({
             "train_loss" : np.mean(train_loss[-epoch_train_obs:]),
-            "train_acc"  : np.mean(train_correct[-epoch_train_obs:]),
-            "test_acc"   : np.mean(test_correct),
+            "train_acc"  : np.mean(train_pred[-epoch_train_obs:]),
+            "test_acc"   : np.mean(test_acc),
             "elapsed"    : time() - t,
         }))
         sys.stdout.flush()
