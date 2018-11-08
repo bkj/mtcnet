@@ -24,11 +24,13 @@ from torchvision import transforms
 from rsub import *
 from matplotlib import pyplot as plt
 
+torch.backends.cudnn.benchmark = True
+torch.manual_seed(123)
+torch.cuda.manual_seed(456)
 
 class OmniglotTaskWrapper:
     def __init__(self, dataset, rotation=False):
         self.dataset  = dataset
-        # self.rotation = rotation
         
         self.lookup = defaultdict(list)
         for idx,(f,lab) in enumerate(dataset._flat_character_images):
@@ -52,8 +54,8 @@ class OmniglotTaskWrapper:
         return task[:1], task[1:]
     
     def sample_tasks(self, batch_size, num_classes, num_shots):
-        # !! This should happen on a separate thread, I think 
-        # Could probably implement a DataLoader that yields tasks
+        # !! TODO: Move to separate thread
+        
         q, X = [], []
         for task in range(batch_size):
             q_, X_ = self.sample_task(num_classes=num_classes, num_shots=num_shots)
@@ -67,12 +69,12 @@ class OmniglotTaskWrapper:
 
 
 class Net(nn.Module):
-    def __init__(self, in_channels=1):
+    def __init__(self, in_channels=1, img_sz=28, hidden_dim=64):
         super().__init__()
         
         self.in_channels = in_channels
-        self.sz         = 28
-        self.hidden_dim = 64
+        self.img_sz      = img_sz
+        self.hidden_dim  = hidden_dim
         
         self.layers = nn.Sequential(
             self._make_layer(in_channels=1, out_channels=self.hidden_dim),
@@ -80,7 +82,6 @@ class Net(nn.Module):
             self._make_layer(in_channels=self.hidden_dim, out_channels=self.hidden_dim),
             self._make_layer(in_channels=self.hidden_dim, out_channels=self.hidden_dim),
         )
-        self.linear = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
     
     def _make_layer(self, in_channels, out_channels):
         return nn.Sequential(
@@ -93,20 +94,18 @@ class Net(nn.Module):
     def _batch_forward(self, x):
         bs   = x.shape[0]
         nobs = x.shape[1]
-        x = x.view(bs * nobs, self.in_channels, self.sz, self.sz)
-        x = self.layers(x)
-        x = x.squeeze(-1).squeeze(-1)
-        x = self.linear(x) # often speeds up convergence
-        x = F.normalize(x, dim=-1)
+        
+        x = x.view(bs * nobs, self.in_channels, self.img_sz, self.img_sz)
+        x = self.layers(x).squeeze()
         x = x.view(bs, nobs, self.hidden_dim)
+        
         return x
-    
+
     def forward(self, q, X):
         X = self._batch_forward(X)
         q = self._batch_forward(q)
-        
-        sim = torch.bmm(q, X.transpose(2, 1))
-        sim = sim.squeeze(1)
+        X = F.normalize(X, dim=-1)
+        sim = torch.bmm(q, X.transpose(1, 2)).squeeze()
         return sim
 
 # --
@@ -148,8 +147,11 @@ train_pred = []
 
 for epoch in range(num_epochs):
     
+    # --
+    # Train
+
     _ = net.train()
-    for step in tqdm(range(num_steps)):
+    for step in range(num_steps):
         opt.zero_grad()
         q, X, y = back_wrapper.sample_tasks(batch_size=batch_size, num_classes=num_classes, num_shots=1)
         sim = net(q, X)
@@ -160,6 +162,9 @@ for epoch in range(num_epochs):
         train_pred += list((sim.argmax(dim=-1) == 0).cpu().numpy())
         train_loss.append(float(loss))
     
+    # --
+    # Eval
+
     _ = net.eval()
     q, X, _ = test_wrapper.sample_tasks(batch_size=10 * batch_size, num_classes=num_classes, num_shots=1)
     sim = net(q, X)
@@ -170,9 +175,5 @@ for epoch in range(num_epochs):
         "train_acc"  : np.mean(train_pred[-100:]),
         "test_acc"   : np.mean(test_pred),
     })
-    _ = net.train()
-    
-    # _ = plt.plot(train_loss)
-    # show_plot()
 
 
