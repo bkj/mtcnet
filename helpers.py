@@ -143,7 +143,7 @@ class MTCNet(nn.Module):
     def mtc_forward(self, q, X):
         X = self._batch_forward(X)
         q = self._batch_forward(q)
-        X = F.normalize(X, dim=-1)
+        X = F.normalize(X, dim=-1) # !! This line may be missing from original implementation
         sim = torch.bmm(q, X.transpose(1, 2)).squeeze()
         return sim
     

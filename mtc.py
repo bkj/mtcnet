@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-    main.py
+    mtc.py
     
     * Super simple implementation of matching networks
     * Only works for 1-shot ATM
